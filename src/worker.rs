@@ -1,15 +1,20 @@
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-use reqwest::Url;
+use std::sync::Arc;
 use std::time::Duration;
+use reqwest::{Client, Url};
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
 use crate::parser::{count_words, extract_links, get_extension, is_under_base_path};
 
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 pub async fn run_node(client: redis::Client) -> Result<()> {
     println!("Node active. Polling jobs from Redis...");
-    let http_client = reqwest::Client::builder()
+    let http_client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
+
+    let semaphore = Arc::new(Semaphore::new(10));
 
     loop {
         let mut con = client.get_async_connection().await?;
@@ -41,7 +46,15 @@ pub async fn run_node(client: redis::Client) -> Result<()> {
             let inflight_key = format!("job:{job_id}:inflight");
             let stats_key = format!("job:{job_id}:stats");
 
-            let url_option: Option<String> = redis::cmd("LPOP").arg(&frontier_key).query_async(&mut con).await?;
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => break, 
+            };
+
+            let url_option: Option<String> = redis::cmd("LPOP")
+                .arg(&frontier_key)
+                .query_async(&mut con)
+                .await?;
 
             if let Some(target_url_str) = url_option {
                 processed_any = true;
@@ -51,33 +64,51 @@ pub async fn run_node(client: redis::Client) -> Result<()> {
                 let mut con_task = client.get_async_connection().await?;
 
                 tokio::spawn(async move {
+                    let _permit = permit;
+
                     if let Ok(res) = http_c.get(&target_url_str).send().await {
-                        if let Ok(html_text) = res.text().await {
-                            let words = count_words(&html_text);
-                            let ext = get_extension(&target_url_str);
+                        if res.status().is_success() {
+                            let content_type = res
+                                .headers()
+                                .get(reqwest::header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+
+                            let is_html = content_type.contains("text/html");
+                            let ext = if is_html {
+                                "html".to_string()
+                            } else {
+                                get_extension(&target_url_str)
+                            };
 
                             let _: () = redis::cmd("HINCRBY").arg(&stats_key).arg("files").arg(1).query_async(&mut con_task).await.unwrap_or(());
-                            let _: () = redis::cmd("HINCRBY").arg(&stats_key).arg("words").arg(words as i64).query_async(&mut con_task).await.unwrap_or(());
                             let _: () = redis::cmd("HINCRBY").arg(&stats_key).arg(format!("ext:{ext}")).arg(1).query_async(&mut con_task).await.unwrap_or(());
 
-                            let links = extract_links(&target_url_str, &html_text);
-                            for link in links {
-                                if let Ok(parsed) = Url::parse(&link) {
-                                    if is_under_base_path(&base_url, &parsed) {
-                                        let added: i32 = redis::cmd("SADD")
-                                            .arg(&visited_key)
-                                            .arg(parsed.as_str())
-                                            .query_async(&mut con_task)
-                                            .await
-                                            .unwrap_or(0);
+                            if is_html {
+                                if let Ok(html_text) = res.text().await {
+                                    let words = count_words(&html_text);
+                                    let _: () = redis::cmd("HINCRBY").arg(&stats_key).arg("words").arg(words as i64).query_async(&mut con_task).await.unwrap_or(());
 
-                                        if added == 1 {
-                                            let _: () = redis::cmd("RPUSH")
-                                                .arg(&frontier_key)
-                                                .arg(parsed.as_str())
-                                                .query_async(&mut con_task)
-                                                .await
-                                                .unwrap_or(());
+                                    let links = extract_links(&target_url_str, &html_text);
+                                    for link in links {
+                                        if let Ok(parsed) = Url::parse(&link) {
+                                            if is_under_base_path(&base_url, &parsed) {
+                                                let added: i32 = redis::cmd("SADD")
+                                                    .arg(&visited_key)
+                                                    .arg(parsed.as_str())
+                                                    .query_async(&mut con_task)
+                                                    .await
+                                                    .unwrap_or(0);
+
+                                                if added == 1 {
+                                                    let _: () = redis::cmd("RPUSH")
+                                                        .arg(&frontier_key)
+                                                        .arg(parsed.as_str())
+                                                        .query_async(&mut con_task)
+                                                        .await
+                                                        .unwrap_or(());
+                                                }
+                                            }
                                         }
                                     }
                                 }

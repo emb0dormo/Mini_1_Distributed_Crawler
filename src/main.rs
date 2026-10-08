@@ -17,7 +17,11 @@ async fn main() -> Result<()> {
     let mut con = client.get_async_connection().await?;
 
     match cli.command {
-        Commands::Submit { url } => submit_job(&mut con, &url).await?,
+        Commands::Submit { urls } => {
+    for url in urls {
+        submit_job(&mut con, &url).await?;
+    }
+}
         Commands::Node => run_node(client).await?,
         Commands::Status { follow, job_id } => monitor_status(&mut con, &job_id, follow).await?,
         Commands::Stats { job_id } => show_stats(&mut con, &job_id).await?,

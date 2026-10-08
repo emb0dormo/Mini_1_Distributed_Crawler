@@ -9,7 +9,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    Submit { url: String },
+    Submit { urls: Vec<String> },
     Node,
     Status {
         #[arg(short, long)]
